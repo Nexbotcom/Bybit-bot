@@ -1,41 +1,46 @@
-# ---- Gold 5M Bot (Bybit data) : BUY + SELL, one trade at a time ----
-# PAPER mode only: uses real Bybit bid/ask and records simulated trades.
-# It never sends an order. Bybit market data is public, so NO Bybit API keys needed.
+# ---- Gold CFD 5M Bot (Bitget CFD data) : BUY + SELL, one trade at a time ----
+# PAPER mode only: uses real Bitget CFD bid/ask prices, never sends an order.
 #
 # Env vars (Railway -> Variables):
+#   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-#   BYBIT_SYMBOL (optional, default XAUUSDT)
-#   BYBIT_CATEGORY (optional, default linear)
-#   DB_PATH      (optional, default gold_5m_bybit.db; use /data/... on Railway)
+#   CFD_SYMBOL   (optional, default XAUUSD)
+#   DB_PATH      (optional, default gold_5m.db; use /data/gold_5m.db on Railway)
 #   MODE         (optional, default PAPER)
 # requirements.txt: requests
 
 import os
 import sys
 import time
+import hmac
+import hashlib
+import base64
 import sqlite3
 import requests
+from urllib.parse import urlencode
 from datetime import datetime, timezone
 
-BASE_URL = "https://api.bybit.com"
+BASE_URL = "https://api.bitget.com"
 
 # ---- strategy settings (USD per ounce = "points") ----
 TF_MS = 300_000               # 5-minute candle
-RUNUP_WINDOW = 12             # look back 12 candles
-TOP_LOOKBACK = 5              # candle 1 must break the last 5 closes
-MIN_MOVE = 10.0               # candle 1 close vs lowest/highest close of last 12
-GAP_TOLERANCE = 0.10          # max |close of candle 1 - open of candle 2|
+RUNUP_WINDOW = 12
+TOP_LOOKBACK = 5
+MIN_MOVE = 10.0
+GAP_TOLERANCE = 0.10
 SL_POINTS = 3.0
 TP_POINTS = 3.0
-MAX_SPREAD = 0.50             # skip a signal if spread is wider than this
+MAX_SPREAD = 0.50
 
 # ---- timing ----
-SCAN_WINDOW_SECONDS = 90      # only scan in the first 90s after a 5M candle closes
+SCAN_WINDOW_SECONDS = 120
 MONITOR_INTERVAL_SECONDS = 2
 SUMMARY_INTERVAL_SECONDS = 86400
 
-TOKEN = CHAT = DB_PATH = SYMBOL = CATEGORY = None
+TOKEN = CHAT = DB_PATH = SYMBOL = None
+API_KEY = API_SECRET = API_PASS = None
 _last_logged = {}
+CANDLE_MODE = None
 
 
 def log(msg):
@@ -115,33 +120,90 @@ def send_telegram(message):
         log(f"[Telegram error] {e}")
 
 
-# ---------------- BYBIT DATA ----------------
+# ---------------- BITGET CFD DATA ----------------
 def api_get(path, params):
-    r = requests.get(BASE_URL + path, params=params, timeout=15)
+    query = urlencode(params)
+    request_path = f"{path}?{query}"
+    ts = str(int(time.time() * 1000))
+    sign = base64.b64encode(
+        hmac.new(API_SECRET.encode(), (ts + "GET" + request_path).encode(),
+                 hashlib.sha256).digest()
+    ).decode()
+    headers = {
+        "ACCESS-KEY": API_KEY, "ACCESS-SIGN": sign, "ACCESS-TIMESTAMP": ts,
+        "ACCESS-PASSPHRASE": API_PASS, "Content-Type": "application/json",
+        "locale": "en-US",
+    }
+    r = requests.get(BASE_URL + request_path, headers=headers, timeout=15)
     try:
         j = r.json()
     except ValueError:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]}")
-    if j.get("retCode") != 0:
-        raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg')}")
-    return j["result"]
+    if j.get("code") != "00000":
+        raise RuntimeError(f"Bitget {j.get('code')}: {j.get('msg')}")
+    return j["data"]
 
 
 def fetch_quote():
     """Returns (bid, ask)."""
-    res = api_get("/v5/market/tickers", {"category": CATEGORY, "symbol": SYMBOL})
-    d = res["list"][0]
-    return float(d["bid1Price"]), float(d["ask1Price"])
+    data = api_get("/api/v3/cfd/market/tickers", {"symbol": SYMBOL})
+    d = data[0] if isinstance(data, list) else data
+    return float(d["bid1"]), float(d["ask1"])
 
 
-def build_5m(now_ms):
-    """Closed 5M candles, oldest first: [start, open, high, low, close].
-    Bybit returns newest first, and the newest one is still forming."""
-    res = api_get("/v5/market/kline", {
-        "category": CATEGORY, "symbol": SYMBOL, "interval": "5", "limit": "60"})
-    rows = [[int(r[0])] + [float(x) for x in r[1:5]] for r in res["list"]]
-    rows.sort(key=lambda r: r[0])
-    return [r for r in rows if r[0] + TF_MS <= now_ms]   # drop the forming candle
+def raw_1m(side):
+    """Last ~100 one-minute candles. side='sell' = bid-based, 'buy' = ask-based."""
+    now_ms = int(time.time() * 1000)
+    data = api_get("/api/v3/cfd/market/history-candlestick", {
+        "symbol": SYMBOL, "interval": "1m", "side": side,
+        "startTime": str(now_ms - 100 * 60000), "limit": "100"})
+    rows = [[int(r[0])] + [float(x) for x in r[1:5]] for r in data]  # [ts,o,h,l,c]
+    return sorted(rows, key=lambda r: r[0])
+
+
+def build_from_1m(rows, now_ms):
+    """Fallback: group 1m candles into closed 5M candles aligned to :00, :05, :10 ...
+    A 5M candle is only built if all 5 one-minute candles exist."""
+    n = TF_MS // 60000
+    buckets = {}
+    for r in rows:
+        buckets.setdefault(r[0] - r[0] % TF_MS, []).append(r)
+    out = []
+    for start in sorted(buckets):
+        grp = sorted(buckets[start])
+        if start + TF_MS > now_ms:                      # still forming
+            continue
+        if [g[0] for g in grp] != [start + k * 60000 for k in range(n)]:
+            continue                                    # missing minute / market break
+        out.append([start, grp[0][1], max(g[2] for g in grp),
+                    min(g[3] for g in grp), grp[-1][4]])
+    return out
+
+
+def native_5m(side, now_ms):
+    data = api_get("/api/v3/cfd/market/history-candlestick", {
+        "symbol": SYMBOL, "interval": "5m", "side": side,
+        "startTime": str(now_ms - 40 * TF_MS), "limit": "100"})
+    rows = sorted([[int(r[0])] + [float(x) for x in r[1:5]] for r in data],
+                  key=lambda r: r[0])
+    return [r for r in rows if r[0] + TF_MS <= now_ms]  # drop the forming candle
+
+
+def get_candles(side, now_ms):
+    """Try native 5m candles first; if Bitget rejects 5m, build them from 1m."""
+    global CANDLE_MODE
+    out, mode = [], "native 5m"
+    try:
+        out = native_5m(side, now_ms)
+    except Exception:
+        out = []
+    if not out:
+        mode = "built from 1m"
+        out = build_from_1m(raw_1m(side), now_ms)
+    if mode != CANDLE_MODE:
+        log(f"[SOURCE] 5M candles: {mode}")
+        CANDLE_MODE = mode
+    return out
 
 
 # ---------------- STRATEGY ----------------
@@ -202,18 +264,20 @@ def scan(boundary_ms):
         return True
 
     try:
-        candles = build_5m(int(time.time() * 1000))
+        now_ms = int(time.time() * 1000)
+        sell_c = get_candles("sell", now_ms)
+        buy_c = get_candles("buy", now_ms)
     except Exception as e:
         log_once("fetch", f"candle fetch failed: {type(e).__name__}: {str(e)[:150]}")
         return False
 
-    if not candles or candles[-1][0] != expected:
+    if not sell_c or not buy_c or sell_c[-1][0] != expected or buy_c[-1][0] != expected:
         log_once("late", f"latest 5M candle {expected} not available yet, retrying")
         return False
 
     when = datetime.fromtimestamp(expected / 1000, timezone.utc).strftime("%m-%d %H:%M")
-    s_ok, s_why = evaluate("sell", candles)
-    b_ok, b_why = evaluate("buy", candles)
+    s_ok, s_why = evaluate("sell", sell_c)
+    b_ok, b_why = evaluate("buy", buy_c)
     log(f"5M [{when}] sell: {s_why} | buy: {b_why}")
 
     if s_ok and b_ok:
@@ -276,6 +340,9 @@ def monitor():
         if not (hit_sl or hit_tp):
             continue
         outcome = "SL" if hit_sl else "TP"
+        if outcome == "TP":                             # a TP order fills at its price
+            px = t["tp"]
+            pnl = TP_POINTS
         close_trade(t["id"], outcome, px, pnl)
         icon = "✅" if outcome == "TP" else "❌"
         send_telegram(
@@ -309,9 +376,9 @@ def summary():
 def pick_source():
     try:
         bid, ask = fetch_quote()
-        c = build_5m(int(time.time() * 1000))
+        c = get_candles("sell", int(time.time() * 1000))
         if not c:
-            log("[SOURCE] no 5M candles returned")
+            log("[SOURCE] no 5M candles could be built")
             return False
         when = datetime.fromtimestamp(c[-1][0] / 1000, timezone.utc).strftime("%m-%d %H:%M")
         log(f"[SOURCE] {SYMBOL}: bid {bid:.2f} ask {ask:.2f} spread {ask - bid:.2f}; "
@@ -323,12 +390,14 @@ def pick_source():
 
 
 def main():
-    global TOKEN, CHAT, DB_PATH, SYMBOL, CATEGORY
+    global TOKEN, CHAT, DB_PATH, SYMBOL, API_KEY, API_SECRET, API_PASS
     TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
     CHAT = os.environ["TELEGRAM_CHAT_ID"]
-    SYMBOL = os.environ.get("BYBIT_SYMBOL", "XAUUSDT")
-    CATEGORY = os.environ.get("BYBIT_CATEGORY", "linear")
-    DB_PATH = os.environ.get("DB_PATH", "gold_5m_bybit.db")
+    API_KEY = os.environ["BITGET_API_KEY"]
+    API_SECRET = os.environ["BITGET_API_SECRET"]
+    API_PASS = os.environ["BITGET_API_PASSPHRASE"]
+    SYMBOL = os.environ.get("CFD_SYMBOL", "XAUUSD")
+    DB_PATH = os.environ.get("DB_PATH", "gold_5m.db")
     mode = os.environ.get("MODE", "PAPER").upper()
     if mode != "PAPER":
         log(f"MODE={mode} is not supported yet. Only PAPER is available. Exiting.")
@@ -339,7 +408,7 @@ def main():
         log("No data reachable, retrying in 60s")
         time.sleep(60)
 
-    send_telegram(f"✅ Gold 5M Bybit bot started [PAPER]\nSymbol: {SYMBOL}\n"
+    send_telegram(f"✅ Gold 5M bot started [PAPER]\nSymbol: {SYMBOL}\n"
                   f"Rules: run-up/down >= {MIN_MOVE}, SL {SL_POINTS} / TP {TP_POINTS}")
     log("5M bot running in PAPER mode")
 
