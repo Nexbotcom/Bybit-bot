@@ -190,20 +190,12 @@ def native_5m(side, now_ms):
 
 
 def get_candles(side, now_ms):
-    """Try native 5m candles first; if Bitget rejects 5m, build them from 1m."""
+    """Bitget's CFD API has no 5m interval, so 5M candles are built from 1m."""
     global CANDLE_MODE
-    out, mode = [], "native 5m"
-    try:
-        out = native_5m(side, now_ms)
-    except Exception:
-        out = []
-    if not out:
-        mode = "built from 1m"
-        out = build_from_1m(raw_1m(side), now_ms)
-    if mode != CANDLE_MODE:
-        log(f"[SOURCE] 5M candles: {mode}")
-        CANDLE_MODE = mode
-    return out
+    if CANDLE_MODE is None:
+        log("[SOURCE] 5M candles: built from 1m")
+        CANDLE_MODE = "built from 1m"
+    return build_from_1m(raw_1m(side), now_ms)
 
 
 # ---------------- STRATEGY ----------------
@@ -276,6 +268,8 @@ def scan(boundary_ms):
         return False
 
     when = datetime.fromtimestamp(expected / 1000, timezone.utc).strftime("%m-%d %H:%M")
+    c = sell_c[-1]
+    log(f"5M [{when}] bid candle O {c[1]:.2f} H {c[2]:.2f} L {c[3]:.2f} C {c[4]:.2f}")
     s_ok, s_why = evaluate("sell", sell_c)
     b_ok, b_why = evaluate("buy", buy_c)
     log(f"5M [{when}] sell: {s_why} | buy: {b_why}")
