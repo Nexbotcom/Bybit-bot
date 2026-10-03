@@ -1,5 +1,1 @@
 requests
-.gitignore
-*.db
-.env
-__pycache__/
