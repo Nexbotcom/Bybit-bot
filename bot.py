@@ -37,6 +37,9 @@ SCAN_WINDOW_SECONDS = 120
 MONITOR_INTERVAL_SECONDS = 2
 SUMMARY_INTERVAL_SECONDS = 86400
 
+MIN_CLOSE_BEYOND = 0.30       # c2 must close at least this far beyond c1's close, in the trade direction
+
+
 TOKEN = CHAT = DB_PATH = SYMBOL = None
 API_KEY = API_SECRET = API_PASS = None
 _last_logged = {}
@@ -201,7 +204,7 @@ def get_candles(side, now_ms):
 # ---------------- STRATEGY ----------------
 def evaluate(direction, candles):
     """direction 'sell' (fade a run-up) or 'buy' (fade a run-down).
-    candles = closed 5M candles, oldest first. Returns (fired, reason)."""
+    candles = closed candles, oldest first. Returns (fired, reason)."""
     need = RUNUP_WINDOW + 2
     if len(candles) < need:
         return False, f"only {len(candles)} candles"
@@ -212,10 +215,13 @@ def evaluate(direction, candles):
 
     closes = [c[4] for c in candles]
     c1, c2 = len(candles) - 2, len(candles) - 1
-    close1, open2, close2 = candles[c1][4], candles[c2][1], candles[c2][4]
+    open1, close1 = candles[c1][1], candles[c1][4]
+    open2, close2 = candles[c2][1], candles[c2][4]
     gap = abs(close1 - open2)
 
     if direction == "sell":
+        if close1 <= open1:
+            return False, f"c1 not bullish (open {open1:.2f} close {close1:.2f})"
         level = max(closes[c1 - TOP_LOOKBACK:c1])
         move = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
         if close1 <= level:
@@ -227,7 +233,10 @@ def evaluate(direction, candles):
         low12 = min(closes[c2 - RUNUP_WINDOW:c2])
         if close2 < low12:
             return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle low"
+        back = close1 - close2                      # how far c2 closed back below c1's close
     else:
+        if close1 >= open1:
+            return False, f"c1 not bearish (open {open1:.2f} close {close1:.2f})"
         level = min(closes[c1 - TOP_LOOKBACK:c1])
         move = max(closes[c1 - RUNUP_WINDOW:c1]) - close1
         if close1 >= level:
@@ -239,8 +248,18 @@ def evaluate(direction, candles):
         high12 = max(closes[c2 - RUNUP_WINDOW:c2])
         if close2 > high12:
             return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle high"
+        back = close2 - close1                      # how far c2 closed back above c1's close
 
-    return True, f"MATCH move {move:.2f} gap {gap:.2f}"
+    if back < MIN_CLOSE_BEYOND:
+        return False, f"c2 closed only {back:.2f} back into/through c1 body, need {MIN_CLOSE_BEYOND}"
+
+    return True, f"MATCH move {move:.2f} gap {gap:.2f} back {back:.2f}"
+
+
+
+
+
+
 
 
 def scan(boundary_ms):
