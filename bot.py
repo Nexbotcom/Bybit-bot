@@ -33,11 +33,11 @@ TP_POINTS = 3.0
 MAX_SPREAD = 0.50
 
 # ---- timing ----
-SCAN_WINDOW_SECONDS = 120
-MONITOR_INTERVAL_SECONDS = 2
+SCAN_WINDOW_SECONDS = 60
+MONITOR_INTERVAL_SECONDS = 1
 SUMMARY_INTERVAL_SECONDS = 86400
 
-MIN_CLOSE_BEYOND = 0.30       # c2 must close at least this far beyond c1's close, in the trade direction
+MIN_CLOSE_BEYOND = 0.50       # c2 must close at least this far beyond c1's close, in the trade direction
 
 
 TOKEN = CHAT = DB_PATH = SYMBOL = None
