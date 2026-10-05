@@ -312,8 +312,9 @@ def scan(boundary_ms):
         log_signal(key)
         return True
 
-    entry = bid if direction == "sell" else ask         # sell fills at bid, buy at ask
-    open_paper_trade(direction, entry, spread, expected)
+    entry = bid if direction == "sell" else ask # sell fills at bid, buy at ask
+    info = trade_info(direction, sell_c if direction == "sell" else buy_c, (bid + ask) / 2)
+    open_paper_trade(direction, entry, spread, expected, info)
     log_signal(key)
     log(f"5M [{when}] {direction.upper()} SIGNAL @ {entry:.2f} (spread {spread:.2f})")
     return True
@@ -443,6 +444,108 @@ def main():
             log(f"Loop error: {type(e).__name__}: {e}")
         time.sleep(MONITOR_INTERVAL_SECONDS)
 
+def init_db():
+    db("""CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            side TEXT, entry REAL, sl REAL, tp REAL, spread REAL,
+            status TEXT DEFAULT 'open', outcome TEXT, exit_price REAL, pnl REAL,
+            signal_time TEXT, opened_at TEXT, closed_at TEXT, info TEXT)""")
+    cols = [r["name"] for r in db("PRAGMA table_info(trades)", fetch=True)]
+    if "info" not in cols:                       # older database: add the new column
+        db("ALTER TABLE trades ADD COLUMN info TEXT")
+    db("CREATE TABLE IF NOT EXISTS signal_log (signal_key TEXT PRIMARY KEY)")
+    db("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
 
+
+def insert_trade(side, entry, sl, tp, spread, signal_ts, info=""):
+    return db("""INSERT INTO trades (side, entry, sl, tp, spread, signal_time, opened_at, info)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (side, entry, sl, tp, spread, str(signal_ts),
+               datetime.now(timezone.utc).isoformat(), info))
+
+
+def move_3h(mid):
+    """Price change over about the last 3 hours, from native 15m candles.
+    Returns None if it cannot be worked out (the trade is never blocked by this)."""
+    try:
+        now_ms = int(time.time() * 1000)
+        data = api_get("/api/v3/cfd/market/history-candlestick", {
+            "symbol": SYMBOL, "interval": "15m", "side": "sell",
+            "startTime": str(now_ms - 5 * 3600000), "limit": "40"})
+        rows = sorted([[int(r[0])] + [float(x) for x in r[1:5]] for r in data],
+                      key=lambda r: r[0])
+        cutoff = now_ms - 3 * 3600000
+        old = [r for r in rows if r[0] + 900000 <= cutoff]   # candles closed 3h+ ago
+        if not old:
+            return None
+        return mid - old[-1][4]
+    except Exception as e:
+        log(f"3h move unavailable: {type(e).__name__}: {str(e)[:100]}")
+        return None
+
+
+def trade_info(direction, candles, mid):
+    """One line of numbers saved with every trade, for later analysis."""
+    cs = candles[-(RUNUP_WINDOW + 2):]
+    closes = [c[4] for c in cs]
+    c1 = len(cs) - 2
+    open1, close1, close2 = cs[c1][1], cs[c1][4], cs[-1][4]
+    if direction == "sell":
+        runup = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
+        back = close1 - close2
+    else:
+        runup = max(closes[c1 - RUNUP_WINDOW:c1]) - close1
+        back = close2 - close1
+    body1 = abs(close1 - open1)
+    avg_range = sum(c[2] - c[3] for c in cs[-RUNUP_WINDOW:]) / RUNUP_WINDOW
+    m3 = move_3h(mid)
+    m3s = f"{m3:+.1f}" if m3 is not None else "n/a"
+    return (f"3h move: {m3s} | Run-up: {runup:.1f} | C1 body: {body1:.1f} | "
+            f"C2 back: {back:.1f} | Avg range: {avg_range:.1f}")
+
+
+def open_paper_trade(direction, entry, spread, signal_ts, info=""):
+    if direction == "sell":
+        sl, tp = entry + SL_POINTS, entry - TP_POINTS
+    else:
+        sl, tp = entry - SL_POINTS, entry + TP_POINTS
+    tid = insert_trade(direction, entry, sl, tp, spread, signal_ts, info)
+    icon = "🔴" if direction == "sell" else "🟢"
+    send_telegram(
+        f"{icon} *GOLD 5M {direction.upper()}* (#{tid}) [PAPER]\n"          # <- 3M bot: write 3M
+        f"Entry: `{entry:.2f}`\nSL: `{sl:.2f}`\nTP: `{tp:.2f}`\n"
+        f"Spread: `{spread:.2f}`\n{info}")
+
+
+def monitor():
+    trades = open_trades()
+    if not trades:
+        return
+    try:
+        bid, ask = fetch_quote()
+    except Exception as e:
+        log_once("mon", f"monitor quote failed: {type(e).__name__}: {str(e)[:150]}")
+        return
+
+    for t in trades:
+        if t["side"] == "sell":                         # a sell closes at the ask
+            px, hit_sl, hit_tp = ask, ask >= t["sl"], ask <= t["tp"]
+            pnl = t["entry"] - px
+        else:                                           # a buy closes at the bid
+            px, hit_sl, hit_tp = bid, bid <= t["sl"], bid >= t["tp"]
+            pnl = px - t["entry"]
+        if not (hit_sl or hit_tp):
+            continue
+        outcome = "SL" if hit_sl else "TP"
+        if outcome == "TP":                             # a TP order fills at its price
+            px = t["tp"]
+            pnl = TP_POINTS
+        close_trade(t["id"], outcome, px, pnl)
+        icon = "✅" if outcome == "TP" else "❌"
+        send_telegram(
+            f"{icon} *GOLD 5M {t['side'].upper()} #{t['id']} closed: {outcome}* [PAPER]\n"   # <- 3M bot: write 3M
+            f"Entry `{t['entry']:.2f}` -> exit `{px:.2f}`\nResult: `{pnl:+.2f}` points\n"
+            f"{t.get('info') or ''}")
+        log(f"trade #{t['id']} {outcome} entry {t['entry']:.2f} exit {px:.2f} pnl {pnl:+.2f}")
 if __name__ == "__main__":
     main()
