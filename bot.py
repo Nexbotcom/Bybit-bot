@@ -1,11 +1,14 @@
-# ---- Gold CFD 5M Bot (Bitget CFD data) : BUY + SELL, one trade at a time ----
-# PAPER mode only: uses real Bitget CFD bid/ask prices, never sends an order.
+# ---- Gold CFD Bot (Bitget CFD data): BUY + SELL, one trade at a time ----
+# The SAME file is used for the 10M bot and the 15M bot. The only difference is
+# the TIMEFRAME_MIN variable set in each Railway project (10 or 15).
+# PAPER mode only: uses real Bitget CFD bid/ask prices and never sends an order.
 #
 # Env vars (Railway -> Variables):
+#   TIMEFRAME_MIN                10 or 15 (required)
 #   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 #   CFD_SYMBOL   (optional, default XAUUSD)
-#   DB_PATH      (optional, default gold_5m.db; use /data/gold_5m.db on Railway)
+#   DB_PATH      (optional, default gold_10m.db / gold_15m.db; use /data/... on Railway)
 #   MODE         (optional, default PAPER)
 # requirements.txt: requests
 
@@ -22,28 +25,40 @@ from datetime import datetime, timezone
 
 BASE_URL = "https://api.bitget.com"
 
-# ---- strategy settings (USD per ounce = "points") ----
-TF_MS = 300_000               # 5-minute candle
-RUNUP_WINDOW = 12
-TOP_LOOKBACK = 5
-MIN_MOVE = 10.0
-GAP_TOLERANCE = 0.10
+# ---- settings that depend on the timeframe (USD per ounce = "points") ----
+SETTINGS = {
+    10: {"min_move": 10.0, "big_move": 15.0, "scan_window": 180},
+    15: {"min_move": 15.0, "big_move": 20.0, "scan_window": 240},
+}
+NATIVE_INTERVAL = {15: "15m"}     # Bitget has no 10m candles, so 10M is built from 1m
+
+# ---- strategy settings (same for both timeframes) ----
+RUNUP_WINDOW = 12             # look back 12 candles for the run-up / run-down
+TOP_LOOKBACK = 5              # candle 1 must break the last 5 closes
+GAP_TOLERANCE = 0.10          # max |close of candle 1 - open of candle 2|
+MIN_CLOSE_BEYOND = 0.30       # candle 2 must close this far back beyond candle 1's close
 SL_POINTS = 3.0
-TP_POINTS = 3.0
-MAX_SPREAD = 0.50
+TP_SMALL = 3.0                # take-profit when run-up is below big_move
+TP_BIG = 5.0                  # take-profit when run-up is big_move or more
+MAX_SPREAD = 0.50             # skip a signal if bid/ask spread is wider than this
 
 # ---- timing ----
-SCAN_WINDOW_SECONDS = 60
 MONITOR_INTERVAL_SECONDS = 2
 SUMMARY_INTERVAL_SECONDS = 86400
 
-MIN_CLOSE_BEYOND = 0.50       # c2 must close at least this far beyond c1's close, in the trade direction
-
-
+TF_MIN = TF_MS = MIN_MOVE = BIG_MOVE = SCAN_WINDOW_SECONDS = None
 TOKEN = CHAT = DB_PATH = SYMBOL = None
 API_KEY = API_SECRET = API_PASS = None
 _last_logged = {}
 CANDLE_MODE = None
+
+
+def configure(tf_min):
+    global TF_MIN, TF_MS, MIN_MOVE, BIG_MOVE, SCAN_WINDOW_SECONDS
+    cfg = SETTINGS[tf_min]
+    TF_MIN, TF_MS = tf_min, tf_min * 60000
+    MIN_MOVE, BIG_MOVE = cfg["min_move"], cfg["big_move"]
+    SCAN_WINDOW_SECONDS = cfg["scan_window"]
 
 
 def log(msg):
@@ -51,6 +66,7 @@ def log(msg):
 
 
 def log_once(key, msg):
+    """Log a message only when it changes (keeps retries from flooding the log)."""
     if _last_logged.get(key) != msg:
         _last_logged[key] = msg
         log(msg)
@@ -154,20 +170,39 @@ def fetch_quote():
     return float(d["bid1"]), float(d["ask1"])
 
 
-def raw_1m(side):
-    """Last ~100 one-minute candles. side='sell' = bid-based, 'buy' = ask-based."""
+def parse_rows(data):
+    return [[int(r[0])] + [float(x) for x in r[1:5]] for r in data]   # [ts,o,h,l,c]
+
+
+def raw_1m(side, minutes):
+    """1m candles for the last `minutes` minutes. Bitget returns at most 100 per
+    request, so this asks again from where the last answer stopped.
+    side='sell' = bid-based candles, side='buy' = ask-based candles."""
     now_ms = int(time.time() * 1000)
-    data = api_get("/api/v3/cfd/market/history-candlestick", {
-        "symbol": SYMBOL, "interval": "1m", "side": side,
-        "startTime": str(now_ms - 100 * 60000), "limit": "100"})
-    rows = [[int(r[0])] + [float(x) for x in r[1:5]] for r in data]  # [ts,o,h,l,c]
-    return sorted(rows, key=lambda r: r[0])
+    start = now_ms - minutes * 60000
+    rows = {}
+    for _ in range(6):
+        data = api_get("/api/v3/cfd/market/history-candlestick", {
+            "symbol": SYMBOL, "interval": "1m", "side": side,
+            "startTime": str(start), "limit": "100"})
+        if not data:
+            break
+        got = parse_rows(data)
+        for r in got:
+            rows[r[0]] = r
+        last = max(r[0] for r in got)
+        if len(got) < 100 or last >= now_ms - 60000:
+            break
+        nxt = last + 60000
+        if nxt <= start:                                # no progress, stop
+            break
+        start = nxt
+    return [rows[k] for k in sorted(rows)]
 
 
 def build_from_1m(rows, now_ms):
-    """Fallback: group 1m candles into closed 5M candles aligned to :00, :05, :10 ...
-    A 5M candle is only built if all 5 one-minute candles exist."""
-    n = TF_MS // 60000
+    """Group 1m candles into closed candles of TF_MIN minutes aligned to the clock.
+    A candle is only built if every one of its 1m candles exists."""
     buckets = {}
     for r in rows:
         buckets.setdefault(r[0] - r[0] % TF_MS, []).append(r)
@@ -176,42 +211,53 @@ def build_from_1m(rows, now_ms):
         grp = sorted(buckets[start])
         if start + TF_MS > now_ms:                      # still forming
             continue
-        if [g[0] for g in grp] != [start + k * 60000 for k in range(n)]:
+        if [g[0] for g in grp] != [start + k * 60000 for k in range(TF_MIN)]:
             continue                                    # missing minute / market break
         out.append([start, grp[0][1], max(g[2] for g in grp),
                     min(g[3] for g in grp), grp[-1][4]])
     return out
 
 
-def native_5m(side, now_ms):
+def native_candles(side, now_ms, interval):
     data = api_get("/api/v3/cfd/market/history-candlestick", {
-        "symbol": SYMBOL, "interval": "5m", "side": side,
-        "startTime": str(now_ms - 40 * TF_MS), "limit": "100"})
-    rows = sorted([[int(r[0])] + [float(x) for x in r[1:5]] for r in data],
-                  key=lambda r: r[0])
+        "symbol": SYMBOL, "interval": interval, "side": side,
+        "startTime": str(now_ms - 24 * TF_MS), "limit": "100"})
+    rows = sorted(parse_rows(data), key=lambda r: r[0])
     return [r for r in rows if r[0] + TF_MS <= now_ms]  # drop the forming candle
 
 
 def get_candles(side, now_ms):
-    """Bitget's CFD API has no 5m interval, so 5M candles are built from 1m."""
+    """15M uses Bitget's own 15m candles. 10M (or a failed native request) is built from 1m."""
     global CANDLE_MODE
-    if CANDLE_MODE is None:
-        log("[SOURCE] 5M candles: built from 1m")
-        CANDLE_MODE = "built from 1m"
-    return build_from_1m(raw_1m(side), now_ms)
+    out, mode = [], "built from 1m"
+    interval = NATIVE_INTERVAL.get(TF_MIN)
+    if interval:
+        try:
+            out = native_candles(side, now_ms, interval)
+            mode = f"native {interval}"
+        except Exception as e:
+            log_once("native", f"native {interval} failed ({str(e)[:100]}), building from 1m")
+            out = []
+    if not out:
+        mode = "built from 1m"
+        out = build_from_1m(raw_1m(side, (RUNUP_WINDOW + 4) * TF_MIN), now_ms)
+    if mode != CANDLE_MODE:
+        log(f"[SOURCE] {TF_MIN}M candles: {mode}")
+        CANDLE_MODE = mode
+    return out
 
 
 # ---------------- STRATEGY ----------------
 def evaluate(direction, candles):
     """direction 'sell' (fade a run-up) or 'buy' (fade a run-down).
-    candles = closed candles, oldest first. Returns (fired, reason)."""
+    candles = closed candles, oldest first. Returns (fired, reason, run_move)."""
     need = RUNUP_WINDOW + 2
     if len(candles) < need:
-        return False, f"only {len(candles)} candles"
+        return False, f"only {len(candles)} candles", 0.0
     candles = candles[-need:]
     for a, b in zip(candles, candles[1:]):
         if b[0] - a[0] != TF_MS:
-            return False, "market break inside lookback"
+            return False, "market break inside lookback", 0.0
 
     closes = [c[4] for c in candles]
     c1, c2 = len(candles) - 2, len(candles) - 1
@@ -221,45 +267,39 @@ def evaluate(direction, candles):
 
     if direction == "sell":
         if close1 <= open1:
-            return False, f"c1 not bullish (open {open1:.2f} close {close1:.2f})"
+            return False, f"c1 not bullish (open {open1:.2f} close {close1:.2f})", 0.0
         level = max(closes[c1 - TOP_LOOKBACK:c1])
         move = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
         if close1 <= level:
-            return False, f"c1 {close1:.2f} not above prior {TOP_LOOKBACK} high {level:.2f}"
+            return False, f"c1 {close1:.2f} not above prior {TOP_LOOKBACK} high {level:.2f}", move
         if move < MIN_MOVE:
-            return False, f"run-up {move:.2f} < {MIN_MOVE}"
+            return False, f"run-up {move:.2f} < {MIN_MOVE}", move
         if gap > GAP_TOLERANCE:
-            return False, f"gap {gap:.2f} > {GAP_TOLERANCE}"
+            return False, f"gap {gap:.2f} > {GAP_TOLERANCE}", move
         low12 = min(closes[c2 - RUNUP_WINDOW:c2])
         if close2 < low12:
-            return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle low"
-        back = close1 - close2                      # how far c2 closed back below c1's close
+            return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle low", move
+        back = close1 - close2                          # how far c2 closed back below c1's close
     else:
         if close1 >= open1:
-            return False, f"c1 not bearish (open {open1:.2f} close {close1:.2f})"
+            return False, f"c1 not bearish (open {open1:.2f} close {close1:.2f})", 0.0
         level = min(closes[c1 - TOP_LOOKBACK:c1])
         move = max(closes[c1 - RUNUP_WINDOW:c1]) - close1
         if close1 >= level:
-            return False, f"c1 {close1:.2f} not below prior {TOP_LOOKBACK} low {level:.2f}"
+            return False, f"c1 {close1:.2f} not below prior {TOP_LOOKBACK} low {level:.2f}", move
         if move < MIN_MOVE:
-            return False, f"run-down {move:.2f} < {MIN_MOVE}"
+            return False, f"run-down {move:.2f} < {MIN_MOVE}", move
         if gap > GAP_TOLERANCE:
-            return False, f"gap {gap:.2f} > {GAP_TOLERANCE}"
+            return False, f"gap {gap:.2f} > {GAP_TOLERANCE}", move
         high12 = max(closes[c2 - RUNUP_WINDOW:c2])
         if close2 > high12:
-            return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle high"
-        back = close2 - close1                      # how far c2 closed back above c1's close
+            return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle high", move
+        back = close2 - close1                          # how far c2 closed back above c1's close
 
     if back < MIN_CLOSE_BEYOND:
-        return False, f"c2 closed only {back:.2f} back into/through c1 body, need {MIN_CLOSE_BEYOND}"
+        return False, f"c2 closed only {back:.2f} back into/through c1 body, need {MIN_CLOSE_BEYOND}", move
 
-    return True, f"MATCH move {move:.2f} gap {gap:.2f} back {back:.2f}"
-
-
-
-
-
-
+    return True, f"MATCH move {move:.2f} gap {gap:.2f} back {back:.2f}", move
 
 
 def scan(boundary_ms):
@@ -270,7 +310,7 @@ def scan(boundary_ms):
     _ = _last_logged.pop("open", None)
 
     expected = boundary_ms - TF_MS                      # open time of candle 2
-    key = f"5M-{expected}"
+    key = f"{TF_MIN}M-{expected}"
     if signaled(key):
         return True
 
@@ -283,15 +323,13 @@ def scan(boundary_ms):
         return False
 
     if not sell_c or not buy_c or sell_c[-1][0] != expected or buy_c[-1][0] != expected:
-        log_once("late", f"latest 5M candle {expected} not available yet, retrying")
+        log_once("late", f"latest {TF_MIN}M candle {expected} not available yet, retrying")
         return False
 
     when = datetime.fromtimestamp(expected / 1000, timezone.utc).strftime("%m-%d %H:%M")
-    c = sell_c[-1]
-    log(f"5M [{when}] bid candle O {c[1]:.2f} H {c[2]:.2f} L {c[3]:.2f} C {c[4]:.2f}")
-    s_ok, s_why = evaluate("sell", sell_c)
-    b_ok, b_why = evaluate("buy", buy_c)
-    log(f"5M [{when}] sell: {s_why} | buy: {b_why}")
+    s_ok, s_why, s_move = evaluate("sell", sell_c)
+    b_ok, b_why, b_move = evaluate("buy", buy_c)
+    log(f"{TF_MIN}M [{when}] sell: {s_why} | buy: {b_why}")
 
     if s_ok and b_ok:
         log("both sides matched, skipping")
@@ -301,6 +339,7 @@ def scan(boundary_ms):
         return True
 
     direction = "sell" if s_ok else "buy"
+    move = s_move if s_ok else b_move
     try:
         bid, ask = fetch_quote()
     except Exception as e:
@@ -308,27 +347,28 @@ def scan(boundary_ms):
         return False
     spread = ask - bid
     if spread > MAX_SPREAD:
-        log(f"5M [{when}] {direction} skipped: spread {spread:.2f} > {MAX_SPREAD}")
+        log(f"{TF_MIN}M [{when}] {direction} skipped: spread {spread:.2f} > {MAX_SPREAD}")
         log_signal(key)
         return True
 
-    entry = bid if direction == "sell" else ask # sell fills at bid, buy at ask
-    info = trade_info(direction, sell_c if direction == "sell" else buy_c, (bid + ask) / 2)
-    open_paper_trade(direction, entry, spread, expected, info)
+    entry = bid if direction == "sell" else ask         # sell fills at bid, buy at ask
+    tp_points = TP_BIG if move >= BIG_MOVE else TP_SMALL
+    open_paper_trade(direction, entry, spread, expected, tp_points)
     log_signal(key)
-    log(f"5M [{when}] {direction.upper()} SIGNAL @ {entry:.2f} (spread {spread:.2f})")
+    log(f"{TF_MIN}M [{when}] {direction.upper()} SIGNAL @ {entry:.2f} "
+        f"(run {move:.2f}, TP {tp_points:.0f}, spread {spread:.2f})")
     return True
 
 
-def open_paper_trade(direction, entry, spread, signal_ts):
+def open_paper_trade(direction, entry, spread, signal_ts, tp_points):
     if direction == "sell":
-        sl, tp = entry + SL_POINTS, entry - TP_POINTS
+        sl, tp = entry + SL_POINTS, entry - tp_points
     else:
-        sl, tp = entry - SL_POINTS, entry + TP_POINTS
+        sl, tp = entry - SL_POINTS, entry + tp_points
     tid = insert_trade(direction, entry, sl, tp, spread, signal_ts)
     icon = "🔴" if direction == "sell" else "🟢"
     send_telegram(
-        f"{icon} *GOLD 5M {direction.upper()}* (#{tid}) [PAPER]\n"
+        f"{icon} *GOLD {TF_MIN}M {direction.upper()}* (#{tid}) [PAPER]\n"
         f"Entry: `{entry:.2f}`\nSL: `{sl:.2f}`\nTP: `{tp:.2f}`\n"
         f"Spread: `{spread:.2f}`")
 
@@ -354,13 +394,10 @@ def monitor():
         if not (hit_sl or hit_tp):
             continue
         outcome = "SL" if hit_sl else "TP"
-        if outcome == "TP":                             # a TP order fills at its price
-            px = t["tp"]
-            pnl = TP_POINTS
-        close_trade(t["id"], outcome, px, pnl)
+        close_trade(t["id"], outcome, px, pnl)          # recorded at the price the check saw
         icon = "✅" if outcome == "TP" else "❌"
         send_telegram(
-            f"{icon} *GOLD 5M {t['side'].upper()} #{t['id']} closed: {outcome}* [PAPER]\n"
+            f"{icon} *GOLD {TF_MIN}M {t['side'].upper()} #{t['id']} closed: {outcome}* [PAPER]\n"
             f"Entry `{t['entry']:.2f}` -> exit `{px:.2f}`\nResult: `{pnl:+.2f}` points")
         log(f"trade #{t['id']} {outcome} entry {t['entry']:.2f} exit {px:.2f} pnl {pnl:+.2f}")
 
@@ -374,15 +411,27 @@ def summary():
         return
     if (now - datetime.fromisoformat(last)).total_seconds() < SUMMARY_INTERVAL_SECONDS:
         return
-    rows = db("SELECT side, outcome, pnl FROM trades WHERE status='closed' AND closed_at>=?",
-              (last,), fetch=True)
-    tp = sum(1 for r in rows if r["outcome"] == "TP")
-    sl = sum(1 for r in rows if r["outcome"] == "SL")
-    net = sum(r["pnl"] or 0 for r in rows)
+    rows = db("""SELECT side, outcome, pnl, entry, tp FROM trades
+                 WHERE status='closed' AND closed_at>=?""", (last,), fetch=True)
+
+    def block(sub):
+        tp = sum(1 for r in sub if r["outcome"] == "TP")
+        sl = sum(1 for r in sub if r["outcome"] == "SL")
+        net = sum(r["pnl"] or 0 for r in sub)
+        return len(sub), tp, sl, net
+
+    big = [r for r in rows if abs(r["tp"] - r["entry"]) >= 4]
+    small = [r for r in rows if abs(r["tp"] - r["entry"]) < 4]
+    n, tp, sl, net = block(rows)
     sells = sum(1 for r in rows if r["side"] == "sell")
+    n3, tp3, sl3, net3 = block(small)
+    n5, tp5, sl5, net5 = block(big)
     send_telegram(
-        f"📊 *Daily Summary (PAPER)*\nClosed: {len(rows)} (sell {sells} / buy {len(rows) - sells})\n"
-        f"TP: {tp} | SL: {sl}\nNet: `{net:+.2f}` points")
+        f"📊 *Daily Summary {TF_MIN}M (PAPER)*\n"
+        f"Closed: {n} (sell {sells} / buy {n - sells})\nTP: {tp} | SL: {sl}\n"
+        f"Net: `{net:+.2f}` points\n\n"
+        f"*$3 target:* {n3} closed | TP {tp3} | SL {sl3} | Net `{net3:+.2f}`\n"
+        f"*$5 target:* {n5} closed | TP {tp5} | SL {sl5} | Net `{net5:+.2f}`")
     set_meta("last_summary_sent", now.isoformat())
 
 
@@ -392,11 +441,11 @@ def pick_source():
         bid, ask = fetch_quote()
         c = get_candles("sell", int(time.time() * 1000))
         if not c:
-            log("[SOURCE] no 5M candles could be built")
+            log(f"[SOURCE] no {TF_MIN}M candles could be built")
             return False
         when = datetime.fromtimestamp(c[-1][0] / 1000, timezone.utc).strftime("%m-%d %H:%M")
         log(f"[SOURCE] {SYMBOL}: bid {bid:.2f} ask {ask:.2f} spread {ask - bid:.2f}; "
-            f"latest closed 5M candle {when} UTC close {c[-1][4]:.2f}")
+            f"latest closed {TF_MIN}M candle {when} UTC close {c[-1][4]:.2f}")
         return True
     except Exception as e:
         log(f"[SOURCE] failed: {type(e).__name__}: {str(e)[:200]}")
@@ -405,13 +454,18 @@ def pick_source():
 
 def main():
     global TOKEN, CHAT, DB_PATH, SYMBOL, API_KEY, API_SECRET, API_PASS
+    tf_min = int(os.environ["TIMEFRAME_MIN"])
+    if tf_min not in SETTINGS:
+        log(f"TIMEFRAME_MIN={tf_min} is not supported. Use 10 or 15. Exiting.")
+        sys.exit(1)
+    configure(tf_min)
     TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
     CHAT = os.environ["TELEGRAM_CHAT_ID"]
     API_KEY = os.environ["BITGET_API_KEY"]
     API_SECRET = os.environ["BITGET_API_SECRET"]
     API_PASS = os.environ["BITGET_API_PASSPHRASE"]
     SYMBOL = os.environ.get("CFD_SYMBOL", "XAUUSD")
-    DB_PATH = os.environ.get("DB_PATH", "gold_5m.db")
+    DB_PATH = os.environ.get("DB_PATH", f"gold_{tf_min}m.db")
     mode = os.environ.get("MODE", "PAPER").upper()
     if mode != "PAPER":
         log(f"MODE={mode} is not supported yet. Only PAPER is available. Exiting.")
@@ -422,9 +476,9 @@ def main():
         log("No data reachable, retrying in 60s")
         time.sleep(60)
 
-    send_telegram(f"✅ Gold 5M bot started [PAPER]\nSymbol: {SYMBOL}\n"
-                  f"Rules: run-up/down >= {MIN_MOVE}, SL {SL_POINTS} / TP {TP_POINTS}")
-    log("5M bot running in PAPER mode")
+    send_telegram(f"✅ Gold {TF_MIN}M bot started [PAPER]\nSymbol: {SYMBOL}\n"
+                  f"Run-up >= {MIN_MOVE:.0f}: TP {TP_SMALL:.0f} | >= {BIG_MOVE:.0f}: TP {TP_BIG:.0f} | SL {SL_POINTS:.0f}")
+    log(f"{TF_MIN}M bot running in PAPER mode")
 
     last_scan = None
     last_summary = 0
@@ -444,108 +498,6 @@ def main():
             log(f"Loop error: {type(e).__name__}: {e}")
         time.sleep(MONITOR_INTERVAL_SECONDS)
 
-def init_db():
-    db("""CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            side TEXT, entry REAL, sl REAL, tp REAL, spread REAL,
-            status TEXT DEFAULT 'open', outcome TEXT, exit_price REAL, pnl REAL,
-            signal_time TEXT, opened_at TEXT, closed_at TEXT, info TEXT)""")
-    cols = [r["name"] for r in db("PRAGMA table_info(trades)", fetch=True)]
-    if "info" not in cols:                       # older database: add the new column
-        db("ALTER TABLE trades ADD COLUMN info TEXT")
-    db("CREATE TABLE IF NOT EXISTS signal_log (signal_key TEXT PRIMARY KEY)")
-    db("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
 
-
-def insert_trade(side, entry, sl, tp, spread, signal_ts, info=""):
-    return db("""INSERT INTO trades (side, entry, sl, tp, spread, signal_time, opened_at, info)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-              (side, entry, sl, tp, spread, str(signal_ts),
-               datetime.now(timezone.utc).isoformat(), info))
-
-
-def move_3h(mid):
-    """Price change over about the last 3 hours, from native 15m candles.
-    Returns None if it cannot be worked out (the trade is never blocked by this)."""
-    try:
-        now_ms = int(time.time() * 1000)
-        data = api_get("/api/v3/cfd/market/history-candlestick", {
-            "symbol": SYMBOL, "interval": "15m", "side": "sell",
-            "startTime": str(now_ms - 5 * 3600000), "limit": "40"})
-        rows = sorted([[int(r[0])] + [float(x) for x in r[1:5]] for r in data],
-                      key=lambda r: r[0])
-        cutoff = now_ms - 3 * 3600000
-        old = [r for r in rows if r[0] + 900000 <= cutoff]   # candles closed 3h+ ago
-        if not old:
-            return None
-        return mid - old[-1][4]
-    except Exception as e:
-        log(f"3h move unavailable: {type(e).__name__}: {str(e)[:100]}")
-        return None
-
-
-def trade_info(direction, candles, mid):
-    """One line of numbers saved with every trade, for later analysis."""
-    cs = candles[-(RUNUP_WINDOW + 2):]
-    closes = [c[4] for c in cs]
-    c1 = len(cs) - 2
-    open1, close1, close2 = cs[c1][1], cs[c1][4], cs[-1][4]
-    if direction == "sell":
-        runup = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
-        back = close1 - close2
-    else:
-        runup = max(closes[c1 - RUNUP_WINDOW:c1]) - close1
-        back = close2 - close1
-    body1 = abs(close1 - open1)
-    avg_range = sum(c[2] - c[3] for c in cs[-RUNUP_WINDOW:]) / RUNUP_WINDOW
-    m3 = move_3h(mid)
-    m3s = f"{m3:+.1f}" if m3 is not None else "n/a"
-    return (f"3h move: {m3s} | Run-up: {runup:.1f} | C1 body: {body1:.1f} | "
-            f"C2 back: {back:.1f} | Avg range: {avg_range:.1f}")
-
-
-def open_paper_trade(direction, entry, spread, signal_ts, info=""):
-    if direction == "sell":
-        sl, tp = entry + SL_POINTS, entry - TP_POINTS
-    else:
-        sl, tp = entry - SL_POINTS, entry + TP_POINTS
-    tid = insert_trade(direction, entry, sl, tp, spread, signal_ts, info)
-    icon = "🔴" if direction == "sell" else "🟢"
-    send_telegram(
-        f"{icon} *GOLD 5M {direction.upper()}* (#{tid}) [PAPER]\n"          # <- 3M bot: write 3M
-        f"Entry: `{entry:.2f}`\nSL: `{sl:.2f}`\nTP: `{tp:.2f}`\n"
-        f"Spread: `{spread:.2f}`\n{info}")
-
-
-def monitor():
-    trades = open_trades()
-    if not trades:
-        return
-    try:
-        bid, ask = fetch_quote()
-    except Exception as e:
-        log_once("mon", f"monitor quote failed: {type(e).__name__}: {str(e)[:150]}")
-        return
-
-    for t in trades:
-        if t["side"] == "sell":                         # a sell closes at the ask
-            px, hit_sl, hit_tp = ask, ask >= t["sl"], ask <= t["tp"]
-            pnl = t["entry"] - px
-        else:                                           # a buy closes at the bid
-            px, hit_sl, hit_tp = bid, bid <= t["sl"], bid >= t["tp"]
-            pnl = px - t["entry"]
-        if not (hit_sl or hit_tp):
-            continue
-        outcome = "SL" if hit_sl else "TP"
-        if outcome == "TP":                             # a TP order fills at its price
-            px = t["tp"]
-            pnl = TP_POINTS
-        close_trade(t["id"], outcome, px, pnl)
-        icon = "✅" if outcome == "TP" else "❌"
-        send_telegram(
-            f"{icon} *GOLD 5M {t['side'].upper()} #{t['id']} closed: {outcome}* [PAPER]\n"   # <- 3M bot: write 3M
-            f"Entry `{t['entry']:.2f}` -> exit `{px:.2f}`\nResult: `{pnl:+.2f}` points\n"
-            f"{t.get('info') or ''}")
-        log(f"trade #{t['id']} {outcome} entry {t['entry']:.2f} exit {px:.2f} pnl {pnl:+.2f}")
 if __name__ == "__main__":
     main()
