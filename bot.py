@@ -82,6 +82,11 @@ def db(sql, params=(), fetch=False):
 
 
 def init_db():
+    cols = [r["name"] for r in db("PRAGMA table_info(trades)", fetch=True)]
+    if cols and "variant" not in cols:                  # old-format table from a previous bot
+        old = "trades_old_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        db(f"ALTER TABLE trades RENAME TO {old}")
+        log(f"Old trades table kept as {old}; starting a fresh one")
     db("""CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             variant TEXT, tf INTEGER, side TEXT, entry REAL, sl REAL, tp REAL, spread REAL,
@@ -89,8 +94,7 @@ def init_db():
             c2_ts INTEGER, c3_pass INTEGER, opened_at TEXT, closed_at TEXT)""")
     db("CREATE TABLE IF NOT EXISTS signal_log (signal_key TEXT PRIMARY KEY)")
     db("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
-
-
+    
 def get_meta(key):
     rows = db("SELECT value FROM bot_meta WHERE key = ?", (key,), fetch=True)
     return rows[0]["value"] if rows else None
