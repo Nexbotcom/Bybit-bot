@@ -2,7 +2,12 @@
 # PAPER mode only: uses real Bitget CFD bid/ask prices and never sends an order.
 #
 # Candle 1 and candle 2 pass the rules, then the bot enters right after candle 2 closes.
-# One trade at a time per timeframe, so 3M and 5M can both be open together.
+# Each timeframe (3M, 5M) runs two independent paper "streams" on the same signals:
+#   BASELINE = takes every signal
+#   FILTERED = takes a signal only if the higher-timeframe trend agrees with the trade
+#              (3M uses the 15m trend, 5M uses the 30m trend; sell needs a down trend,
+#               buy needs an up trend)
+# One trade at a time per stream, so 3M and 5M (and both variants) can all be open together.
 #
 # Env vars (Railway -> Variables):
 #   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE
@@ -31,7 +36,9 @@ SETTINGS = {
     5: {"min_move": 10.0, "scan_window": 120},
 }
 TIMEFRAMES = [3, 5]
-VARIANT = "BASELINE"          # name kept so an existing database keeps working
+HTF_MIN = {3: 15, 5: 30}      # higher timeframe used as the trend filter for each timeframe
+EMA_PERIOD = 20               # trend = closed higher-timeframe closes vs their 20-candle average
+SLOPE_CANDLES = 3             # the average must also be rising/falling over the last 3 candles
 
 # ---- strategy settings (same for both timeframes) ----
 RUNUP_WINDOW = 12             # look back 12 candles for the run-up / run-down
@@ -89,6 +96,8 @@ def init_db():
             variant TEXT, tf INTEGER, side TEXT, entry REAL, sl REAL, tp REAL, spread REAL,
             status TEXT DEFAULT 'open', outcome TEXT, exit_price REAL, pnl REAL,
             c2_ts INTEGER, c3_pass INTEGER, opened_at TEXT, closed_at TEXT)""")
+    if "htf" not in [r["name"] for r in db("PRAGMA table_info(trades)", fetch=True)]:
+        db("ALTER TABLE trades ADD COLUMN htf TEXT")      # new column for the trend tag
     db("CREATE TABLE IF NOT EXISTS signal_log (signal_key TEXT PRIMARY KEY)")
     db("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
 
@@ -112,15 +121,15 @@ def log_signal(key):
 
 def open_trades(tf=None, variant=None):
     if tf is None:
-        return db("SELECT * FROM trades WHERE status='open' AND variant=?", (VARIANT,), fetch=True)
+        return db("SELECT * FROM trades WHERE status='open'", fetch=True)
     return db("SELECT * FROM trades WHERE status='open' AND tf=? AND variant=?",
               (tf, variant), fetch=True)
 
 
-def insert_trade(variant, tf, side, entry, sl, tp, spread, c2_ts):
-    return db("""INSERT INTO trades (variant, tf, side, entry, sl, tp, spread, c2_ts, opened_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-              (variant, tf, side, entry, sl, tp, spread, c2_ts,
+def insert_trade(variant, tf, side, entry, sl, tp, spread, c2_ts, htf):
+    return db("""INSERT INTO trades (variant, tf, side, entry, sl, tp, spread, c2_ts, htf, opened_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              (variant, tf, side, entry, sl, tp, spread, c2_ts, htf,
                datetime.now(timezone.utc).isoformat()))
 
 
@@ -234,6 +243,53 @@ def get_candles(side, tf, now_ms):
     return build_from_1m(raw_1m(side, (RUNUP_WINDOW + 4) * tf), tf, now_ms)
 
 
+# ---------------- HIGHER-TIMEFRAME TREND ----------------
+def htf_closes(tf, now_ms):
+    """Closed higher-timeframe closes [(ts, close)], oldest first. 15m is Bitget's own candle;
+    30m is built from two 15m candles. Uses the newest 100 15m candles of the last 6 days,
+    so it also works after a weekend."""
+    data = api_get("/api/v3/cfd/market/history-candlestick", {
+        "symbol": SYMBOL, "interval": "15m", "side": "sell",
+        "startTime": str(now_ms - 6 * 86400000), "endTime": str(now_ms + 60000), "limit": "100"})
+    rows = sorted(parse_rows(data), key=lambda r: r[0]) if data else []
+    rows = [r for r in rows if r[0] + 900000 <= now_ms]            # closed candles only
+    if HTF_MIN[tf] == 15:
+        return [(r[0], r[4]) for r in rows]
+    by_ts = {r[0]: r for r in rows}
+    return [(ts, by_ts[ts + 900000][4]) for ts in sorted(by_ts)
+            if ts % 1800000 == 0 and ts + 900000 in by_ts]          # close of the 2nd 15m candle
+
+
+def htf_state(tf, now_ms):
+    """'up', 'down', 'flat', or None when there is not enough fresh data."""
+    items = htf_closes(tf, now_ms)
+    step = HTF_MIN[tf] * 60000
+    if len(items) < EMA_PERIOD + SLOPE_CANDLES + 5:
+        return None
+    if now_ms - (items[-1][0] + step) > 3 * step:                  # market closed / data stale
+        return None
+    closes = [c for _, c in items]
+    alpha = 2 / (EMA_PERIOD + 1)
+    ema = [closes[0]]
+    for c in closes[1:]:
+        ema.append(alpha * c + (1 - alpha) * ema[-1])
+    last, now_avg, old_avg = closes[-1], ema[-1], ema[-1 - SLOPE_CANDLES]
+    if last > now_avg and now_avg > old_avg:
+        return "up"
+    if last < now_avg and now_avg < old_avg:
+        return "down"
+    return "flat"
+
+
+def htf_relation(side, state):
+    """'with' / 'against' the higher-timeframe trend, 'flat', or None if unknown."""
+    if state is None:
+        return None
+    if state == "flat":
+        return "flat"
+    return "with" if (side == "sell") == (state == "down") else "against"
+
+
 # ---------------- STRATEGY ----------------
 def evaluate(direction, candles, tf):
     """Candle 1 / candle 2 rules. direction 'sell' (fade a run-up) or 'buy' (fade a run-down).
@@ -296,48 +352,35 @@ def one_side(sell_ok, buy_ok):
     return "sell" if sell_ok else ("buy" if buy_ok else None)
 
 
-def open_paper_trade(tf, direction, entry, spread, c2_ts):
+def open_paper_trade(variant, tf, direction, entry, spread, c2_ts, rel):
     if direction == "sell":
         sl, tp = entry + SL_POINTS, entry - TP_POINTS
     else:
         sl, tp = entry - SL_POINTS, entry + TP_POINTS
-    tid = insert_trade(VARIANT, tf, direction, entry, sl, tp, spread, c2_ts)
+    tid = insert_trade(variant, tf, direction, entry, sl, tp, spread, c2_ts, rel)
     icon = "🔴" if direction == "sell" else "🟢"
     send_telegram(
-        f"{icon} *GOLD {tf}M {direction.upper()}* (#{tid}) [PAPER]\n"
+        f"{icon} *GOLD {tf}M {direction.upper()}* (#{tid}) [{variant}] [PAPER]\n"
         f"Entry: `{entry:.2f}`\nSL: `{sl:.2f}`\nTP: `{tp:.2f}`\n"
-        f"Spread: `{spread:.2f}`")
+        f"Spread: `{spread:.2f}`\nHTF {HTF_MIN[tf]}m: {rel or 'unknown'}\n"
+        f"Signal: {hm(c2_ts)} UTC")
     return tid
-
-
-def enter(tf, direction, c2_ts, key):
-    """Take the quote and open a paper trade. True = handled, False = quote problem (retry)."""
-    try:
-        bid, ask = fetch_quote()
-    except Exception as e:
-        log(f"{tf}M {direction} matched but quote fetch failed: {e}")
-        return False
-    spread = ask - bid
-    log_signal(key)
-    if spread > MAX_SPREAD:
-        log(f"{tf}M {direction} skipped: spread {spread:.2f} > {MAX_SPREAD}")
-        return True
-    entry = bid if direction == "sell" else ask         # sell fills at bid, buy at ask
-    open_paper_trade(tf, direction, entry, spread, c2_ts)
-    log(f"{tf}M {direction.upper()} SIGNAL @ {entry:.2f} (spread {spread:.2f})")
-    return True
 
 
 def scan(tf, boundary_ms):
     """Candle 2 has just closed. True = finished. False = retry (data/quote problem)."""
-    if open_trades(tf, VARIANT):
-        log_once(f"open-{tf}", f"{tf}M scan skipped: a trade is open")
+    base_free = not open_trades(tf, "BASELINE")
+    filt_free = not open_trades(tf, "FILTERED")
+    if not base_free and not filt_free:
+        log_once(f"open-{tf}", f"{tf}M scan skipped: trades are open in both streams")
         return True
     _last_logged.pop(f"open-{tf}", None)
 
     last_closed = boundary_ms - tf * 60000              # open time of candle 2
-    key = f"B-{tf}M-{last_closed}"
-    if signaled(key):
+    bkey, fkey = f"B-{tf}M-{last_closed}", f"F-{tf}M-{last_closed}"
+    base_todo = base_free and not signaled(bkey)
+    filt_todo = filt_free and not signaled(fkey)
+    if not base_todo and not filt_todo:
         return True
     try:
         now_ms = int(time.time() * 1000)
@@ -355,10 +398,42 @@ def scan(tf, boundary_ms):
     log(f"{tf}M [{hm(last_closed)}] sell: {s_why} | buy: {b_why}")
     side = one_side(s_ok, b_ok)
     if s_ok and b_ok:
-        log_signal(key)
+        log_signal(bkey)
+        log_signal(fkey)
         return True
-    if side:
-        return enter(tf, side, last_closed, key)
+    if not side:
+        return True
+
+    try:
+        bid, ask = fetch_quote()
+    except Exception as e:
+        log(f"{tf}M {side} matched but quote fetch failed: {e}")
+        return False
+    spread = ask - bid
+    if spread > MAX_SPREAD:
+        log(f"{tf}M {side} skipped: spread {spread:.2f} > {MAX_SPREAD}")
+        log_signal(bkey)
+        log_signal(fkey)
+        return True
+
+    try:
+        state = htf_state(tf, now_ms)
+    except Exception as e:
+        log(f"{tf}M higher-timeframe check failed: {type(e).__name__}: {str(e)[:100]}")
+        state = None
+    rel = htf_relation(side, state)
+    entry = bid if side == "sell" else ask              # sell fills at bid, buy at ask
+    log(f"{tf}M [{hm(last_closed)}] {side.upper()} SIGNAL @ {entry:.2f} "
+        f"(HTF {HTF_MIN[tf]}m {state or 'unknown'} -> {rel or 'unknown'})")
+    if base_todo:
+        log_signal(bkey)
+        open_paper_trade("BASELINE", tf, side, entry, spread, last_closed, rel)
+    if filt_todo:
+        log_signal(fkey)
+        if rel == "with":
+            open_paper_trade("FILTERED", tf, side, entry, spread, last_closed, rel)
+        else:
+            log(f"{tf}M FILTERED skipped: higher-timeframe trend is {rel or 'unknown'}")
     return True
 
 
@@ -386,9 +461,11 @@ def monitor():
         close_trade(t["id"], outcome, px, pnl)          # recorded at the price the check saw
         icon = "✅" if outcome == "TP" else "❌"
         send_telegram(
-            f"{icon} *GOLD {t['tf']}M {t['side'].upper()} #{t['id']} closed: {outcome}* [PAPER]\n"
-            f"Entry `{t['entry']:.2f}` -> exit `{px:.2f}`\nResult: `{pnl:+.2f}` points")
-        log(f"trade #{t['id']} {t['tf']}M {outcome} entry {t['entry']:.2f} "
+            f"{icon} *GOLD {t['tf']}M {t['side'].upper()} #{t['id']} closed: {outcome}* "
+            f"[{t['variant']}] [PAPER]\n"
+            f"Entry `{t['entry']:.2f}` -> exit `{px:.2f}`\nResult: `{pnl:+.2f}` points\n"
+            f"Signal: {hm(t['c2_ts'])} UTC")
+        log(f"trade #{t['id']} {t['tf']}M {t['variant']} {outcome} entry {t['entry']:.2f} "
             f"exit {px:.2f} pnl {pnl:+.2f}")
 
 
@@ -401,9 +478,8 @@ def summary():
         return
     if (now - datetime.fromisoformat(last)).total_seconds() < SUMMARY_INTERVAL_SECONDS:
         return
-    rows = db("""SELECT tf, side, outcome, pnl FROM trades
-                 WHERE status='closed' AND variant=? AND closed_at>=?""",
-              (VARIANT, last), fetch=True)
+    rows = db("""SELECT variant, tf, outcome, pnl, htf FROM trades
+                 WHERE status='closed' AND closed_at>=?""", (last,), fetch=True)
 
     def line(label, sub):
         tp = sum(1 for r in sub if r["outcome"] == "TP")
@@ -412,11 +488,13 @@ def summary():
 
     parts = ["📊 *Daily Summary (PAPER)*"]
     for tf in TIMEFRAMES:
-        sub = [r for r in rows if r["tf"] == tf]
-        parts.append(line(f"{tf}M", sub))
-        parts.append(line("   sells", [r for r in sub if r["side"] == "sell"]))
-        parts.append(line("   buys", [r for r in sub if r["side"] == "buy"]))
-    parts.append(line("Total", rows))
+        base = [r for r in rows if r["tf"] == tf and r["variant"] == "BASELINE"]
+        filt = [r for r in rows if r["tf"] == tf and r["variant"] == "FILTERED"]
+        parts += ["", f"*{tf}M* (trend filter: {HTF_MIN[tf]}m)",
+                  line("Baseline", base), line("Filtered", filt),
+                  line("Baseline with the trend", [r for r in base if r["htf"] == "with"]),
+                  line("Baseline trend flat", [r for r in base if r["htf"] == "flat"]),
+                  line("Baseline against the trend", [r for r in base if r["htf"] == "against"])]
     send_telegram("\n".join(parts))
     set_meta("last_summary_sent", now.isoformat())
 
@@ -458,7 +536,9 @@ def main():
 
     send_telegram(f"✅ Gold 3M + 5M bot started [PAPER]\nSymbol: {SYMBOL}\n"
                   f"3M run-up >= {SETTINGS[3]['min_move']:.0f} | 5M run-up >= {SETTINGS[5]['min_move']:.0f} "
-                  f"| SL {SL_POINTS:.0f} / TP {TP_POINTS:.0f}")
+                  f"| SL {SL_POINTS:.0f} / TP {TP_POINTS:.0f}\n"
+                  f"Streams: BASELINE (all signals) and FILTERED (only with the {HTF_MIN[3]}m / "
+                  f"{HTF_MIN[5]}m trend)")
     log("3M + 5M bot running in PAPER mode")
 
     last_scan = {tf: None for tf in TIMEFRAMES}
