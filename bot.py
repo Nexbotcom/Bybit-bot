@@ -1,5 +1,5 @@
- # ---- Gold CFD Bot (Bitget CFD data): 3M and 5M together, BUY + SELL ----
-# PAPER mode only: uses real Bitget CFD bid/ask prices and never sends an order.
+# ---- Gold CFD Bot (Bitget CFD data): 3M and 5M together, BUY + SELL ----
+# PAPER mode only: uses real Bitget CFD bid/ask prices and never sends an order
 #
 # Candle 1 and candle 2 pass the rules, then the bot enters right after candle 2 closes.
 # Each timeframe (3M, 5M) runs two independent paper "streams" on the same signals:
