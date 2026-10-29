@@ -272,15 +272,21 @@ def moving(direction, c):
 
 
 def reversal_ok(side, series, tf):
-    """Reversal rule for `side`: candle 1 is bullish (sell) or bearish (buy) and
-    candle 1's close is candle 2's open. Nothing else is checked."""
+    """Reversal rule for `side`: candle 1 is bullish (sell) or bearish (buy), candle 1's close
+    is candle 2's open, and candle 2 closes back inside/through candle 1 by at least
+    MIN_CLOSE_BEYOND (so a straight staircase move does not count). Nothing else is checked."""
     if len(series) < 2:
         return False
     c1, c2 = series[-2], series[-1]
     if c2[0] - c1[0] != tf * 60000:
         return False
-    colour = c1[4] > c1[1] if side == "sell" else c1[4] < c1[1]
-    return colour and abs(c1[4] - c2[1]) <= GAP_TOLERANCE
+    if side == "sell":
+        colour = c1[4] > c1[1]
+        back = c1[4] - c2[4]                            # c2 closed back down into/through c1
+    else:
+        colour = c1[4] < c1[1]
+        back = c2[4] - c1[4]                            # c2 closed back up into/through c1
+    return colour and abs(c1[4] - c2[1]) <= GAP_TOLERANCE and back >= MIN_CLOSE_BEYOND
 
 
 # ---------------- STRATEGY ----------------
