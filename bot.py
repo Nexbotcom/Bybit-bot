@@ -39,7 +39,7 @@ SETTINGS = {
     5: {"min_move": 10.0, "scan_window": 120},
 }
 TIMEFRAMES = [3, 5]
-STRAIGHT_CANDLES = 5          # straight candles needed to lift a block after a stop-loss
+STRAIGHT_CANDLES = 3          # straight candles needed to lift a block after a stop-loss
 LABELS = {"BASELINE": "BASELINE", "AFTER_SL": "AFTER-SL", "FILTERED": "FILTERED"}
 
 # ---- strategy settings (same for both timeframes) ----
