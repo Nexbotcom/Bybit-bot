@@ -1,27 +1,22 @@
-# ---- Gold CFD Bot (Bitget CFD data): 3M and 5M together, BUY + SELL ----
+# ---- Gold CFD Bot (Bitget CFD data): 5M and 10M, SELL ONLY ----
 # PAPER mode only: uses real Bitget CFD bid/ask prices and never sends an order.
 #
-# Candle 1 and candle 2 pass the rules, then the bot enters right after candle 2 closes.
-# Each timeframe (3M, 5M) runs two paper "streams" on the same market:
-#   BASELINE = takes every signal, ignores locks. SILENT: no Telegram messages,
-#              only counted in the daily summary so you can compare.
-#   AFTER_SL = the real stream. Follows the lock rules and sends all the messages.
-#
-# LOCK RULES (each timeframe has its own SELL lock and BUY lock):
-#   * A stop-loss on a SELL locks SELLS on that timeframe until 3 straight falling candles.
-#   * A stop-loss on a BUY locks BUYS on that timeframe until 3 straight rising candles.
-#   * The other direction keeps trading unless it is locked too.
-#   * RESTART: while a lock is counting, if the last two closed candles pass the check
-#     (sell lock: candle 1 bullish / buy lock: candle 1 bearish, candle 1 close and
-#     candle 2 open within 0.10, candle 2 closes back against candle 1 by at least 0.30)
-#     the count goes back to 0 and needs 3 straight candles again.
-#   * If a candle is both "straight" and passes the restart check, the restart wins.
+# Candle 1 and candle 2 pass the rules, then the bot enters a sell right after candle 2 closes.
+# Each timeframe (5M, 10M) runs two independent paper streams:
+#   BASELINE = old rules, takes every signal (silent: no Telegram messages, summary only)
+#   MAIN     = old rules + the step rule + the stop-loss block (sends the Telegram messages)
+#     * step rule: among the 5 candles before candle 1 there must be two neighbouring
+#       bullish candles where the second closes higher than the first
+#     * stop-loss block: after a stop-loss, MAIN waits until the market gives 3 straight
+#       falling candles; a "reset pair" (candle 1 bullish, candle 2 opens at candle 1's close
+#       and closes at least 0.30 below it) puts the count back to 0
+# One trade at a time per stream, so 5M and 10M (and both streams) can all be open together.
 #
 # Env vars (Railway -> Variables):
 #   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 #   CFD_SYMBOL   (optional, default XAUUSD)
-#   DB_PATH      (optional, default gold_3m5m.db; use /data/gold_3m5m.db on Railway)
+#   DB_PATH      (optional, default gold_5m10m.db; use /data/gold_5m10m.db on Railway)
 #   MODE         (optional, default PAPER)
 # requirements.txt: requests
 
@@ -40,17 +35,17 @@ BASE_URL = "https://api.bitget.com"
 
 # ---- per timeframe settings (USD per ounce = "points") ----
 SETTINGS = {
-    3: {"min_move": 5.0, "scan_window": 90},
     5: {"min_move": 10.0, "scan_window": 120},
+    10: {"min_move": 15.0, "scan_window": 180},
 }
-TIMEFRAMES = [3, 5]
-STRAIGHT_CANDLES = 3          # straight candles needed to unlock a direction after a stop-loss
+TIMEFRAMES = [5, 10]
+STRAIGHT_CANDLES = 3          # straight falling candles needed to lift the block after a stop-loss
 
 # ---- strategy settings (same for both timeframes) ----
-RUNUP_WINDOW = 12             # look back 12 candles for the run-up / run-down
-TOP_LOOKBACK = 5              # candle 1 must break the last 5 closes
+RUNUP_WINDOW = 12             # look back 12 candles for the run-up
+TOP_LOOKBACK = 5              # candle 1 must break the last 5 closes (also the step-rule window)
 GAP_TOLERANCE = 0.10          # max |close of candle 1 - open of candle 2|
-MIN_CLOSE_BEYOND = 0.30       # candle 2 must close at least this far back against candle 1's close
+MIN_CLOSE_BEYOND = 0.30       # candle 2 must close at least this far below candle 1's close
 SL_POINTS = 3.0
 TP_POINTS = 3.0
 MAX_SPREAD = 0.50             # skip a signal if bid/ask spread is wider than this
@@ -101,10 +96,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             variant TEXT, tf INTEGER, side TEXT, entry REAL, sl REAL, tp REAL, spread REAL,
             status TEXT DEFAULT 'open', outcome TEXT, exit_price REAL, pnl REAL,
-            c2_ts INTEGER, c3_pass INTEGER, opened_at TEXT, closed_at TEXT)""")
-    have = [r["name"] for r in db("PRAGMA table_info(trades)", fetch=True)]
-    if "htf" not in have:
-        db("ALTER TABLE trades ADD COLUMN htf TEXT")      # kept so older databases keep working
+            c2_ts INTEGER, opened_at TEXT, closed_at TEXT)""")
     db("CREATE TABLE IF NOT EXISTS signal_log (signal_key TEXT PRIMARY KEY)")
     db("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
 
@@ -116,6 +108,10 @@ def get_meta(key):
 
 def set_meta(key, value):
     db("INSERT OR REPLACE INTO bot_meta (key, value) VALUES (?, ?)", (key, value))
+
+
+def bump(key):
+    set_meta(key, str(int(get_meta(key) or 0) + 1))
 
 
 def signaled(key):
@@ -133,11 +129,10 @@ def open_trades(tf=None, variant=None):
               (tf, variant), fetch=True)
 
 
-def insert_trade(variant, tf, side, entry, sl, tp, spread, c2_ts):
+def insert_trade(variant, tf, entry, sl, tp, spread, c2_ts):
     return db("""INSERT INTO trades (variant, tf, side, entry, sl, tp, spread, c2_ts, opened_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-              (variant, tf, side, entry, sl, tp, spread, c2_ts,
-               datetime.now(timezone.utc).isoformat()))
+                 VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?)""",
+              (variant, tf, entry, sl, tp, spread, c2_ts, datetime.now(timezone.utc).isoformat()))
 
 
 def close_trade(trade_id, outcome, exit_price, pnl):
@@ -191,17 +186,16 @@ def parse_rows(data):
     return [[int(r[0])] + [float(x) for x in r[1:5]] for r in data]   # [ts,o,h,l,c]
 
 
-def raw_1m(side, minutes):
-    """1m candles for the last `minutes` minutes. Bitget returns at most 100 per
-    request (the newest 100 in the range), so this pages backwards with endTime.
-    side='sell' = candles used for sell signals, side='buy' = candles used for buy signals."""
+def raw_1m(minutes):
+    """1m candles (the ones used for sell signals) for the last `minutes` minutes. Bitget
+    returns at most 100 per request (the newest 100 in the range), so this pages backwards."""
     now_ms = int(time.time() * 1000)
     start = now_ms - minutes * 60000
     rows = {}
 
     def grab(s, e):
         data = api_get("/api/v3/cfd/market/history-candlestick", {
-            "symbol": SYMBOL, "interval": "1m", "side": side,
+            "symbol": SYMBOL, "interval": "1m", "side": "sell",
             "startTime": str(s), "endTime": str(e), "limit": "100"})
         got = parse_rows(data) if data else []
         for r in got:
@@ -246,53 +240,14 @@ def build_from_1m(rows, tf, now_ms):
     return out
 
 
-def get_candles(side, tf, now_ms):
-    return build_from_1m(raw_1m(side, (RUNUP_WINDOW + 4) * tf), tf, now_ms)
+def get_candles(tf, now_ms):
+    return build_from_1m(raw_1m((RUNUP_WINDOW + 4) * tf), tf, now_ms)
 
 
-# ---------------- LOCKS (one SELL lock and one BUY lock per timeframe, kept in the database) ----------------
-def lock_get(tf, d):
-    """(locked?, straight-candle count, stop-loss time in ms, last counted candle ts)."""
-    return (get_meta(f"lock_on_{tf}_{d}") == "1",
-            int(get_meta(f"lock_cnt_{tf}_{d}") or 0),
-            int(get_meta(f"lock_since_{tf}_{d}") or 0),
-            int(get_meta(f"lock_last_{tf}_{d}") or 0))
-
-
-def lock_set(tf, d, on, count, since, last):
-    set_meta(f"lock_on_{tf}_{d}", "1" if on else "0")
-    set_meta(f"lock_cnt_{tf}_{d}", str(count))
-    set_meta(f"lock_since_{tf}_{d}", str(since))
-    set_meta(f"lock_last_{tf}_{d}", str(last))
-
-
-def moving(direction, c):
-    """A candle moving in the locked direction: falling for 'sell', rising for 'buy'."""
-    return c[4] < c[1] if direction == "sell" else c[4] > c[1]
-
-
-def restart_ok(side, series, tf):
-    """Restart rule for a lock on `side`: candle 1 is bullish (sell) or bearish (buy),
-    candle 1's close and candle 2's open are within GAP_TOLERANCE, and candle 2 closes
-    back against candle 1 by at least MIN_CLOSE_BEYOND. Nothing else is checked."""
-    if len(series) < 2:
-        return False
-    c1, c2 = series[-2], series[-1]
-    if c2[0] - c1[0] != tf * 60000:
-        return False
-    if side == "sell":
-        colour = c1[4] > c1[1]
-        back = c1[4] - c2[4]
-    else:
-        colour = c1[4] < c1[1]
-        back = c2[4] - c1[4]
-    return colour and abs(c1[4] - c2[1]) <= GAP_TOLERANCE and back >= MIN_CLOSE_BEYOND
-
-
-# ---------------- STRATEGY ----------------
-def evaluate(direction, candles, tf):
-    """Candle 1 / candle 2 rules. direction 'sell' (fade a run-up) or 'buy' (fade a run-down).
-    candles = closed candles, oldest first, the last one is candle 2. Returns (fired, reason)."""
+# ---------------- RULES ----------------
+def evaluate_sell(candles, tf):
+    """The old sell rules (candle 1 / candle 2 and the run-up). candles = closed candles,
+    oldest first, the last one is candle 2. Returns (fired, reason)."""
     tf_ms, min_move = tf * 60000, SETTINGS[tf]["min_move"]
     need = RUNUP_WINDOW + 2
     if len(candles) < need:
@@ -308,64 +263,70 @@ def evaluate(direction, candles, tf):
     open2, close2 = candles[c2][1], candles[c2][4]
     gap = abs(close1 - open2)
 
-    if direction == "sell":
-        if close1 <= open1:
-            return False, f"c1 not bullish (open {open1:.2f} close {close1:.2f})"
-        level = max(closes[c1 - TOP_LOOKBACK:c1])
-        move = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
-        if close1 <= level:
-            return False, f"c1 {close1:.2f} not above prior {TOP_LOOKBACK} high {level:.2f}"
-        if move < min_move:
-            return False, f"run-up {move:.2f} < {min_move}"
-        if gap > GAP_TOLERANCE:
-            return False, f"gap {gap:.2f} > {GAP_TOLERANCE}"
-        low12 = min(closes[c2 - RUNUP_WINDOW:c2])
-        if close2 < low12:
-            return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle low"
-        back = close1 - close2
-    else:
-        if close1 >= open1:
-            return False, f"c1 not bearish (open {open1:.2f} close {close1:.2f})"
-        level = min(closes[c1 - TOP_LOOKBACK:c1])
-        move = max(closes[c1 - RUNUP_WINDOW:c1]) - close1
-        if close1 >= level:
-            return False, f"c1 {close1:.2f} not below prior {TOP_LOOKBACK} low {level:.2f}"
-        if move < min_move:
-            return False, f"run-down {move:.2f} < {min_move}"
-        if gap > GAP_TOLERANCE:
-            return False, f"gap {gap:.2f} > {GAP_TOLERANCE}"
-        high12 = max(closes[c2 - RUNUP_WINDOW:c2])
-        if close2 > high12:
-            return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle high"
-        back = close2 - close1
-
+    if close1 <= open1:
+        return False, f"c1 not bullish (open {open1:.2f} close {close1:.2f})"
+    level = max(closes[c1 - TOP_LOOKBACK:c1])
+    move = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
+    if close1 <= level:
+        return False, f"c1 {close1:.2f} not above prior {TOP_LOOKBACK} high {level:.2f}"
+    if move < min_move:
+        return False, f"run-up {move:.2f} < {min_move}"
+    if gap > GAP_TOLERANCE:
+        return False, f"gap {gap:.2f} > {GAP_TOLERANCE}"
+    low12 = min(closes[c2 - RUNUP_WINDOW:c2])
+    if close2 < low12:
+        return False, f"c2 close {close2:.2f} is a new {RUNUP_WINDOW}-candle low"
+    back = close1 - close2
     if back < MIN_CLOSE_BEYOND:
-        return False, f"c2 closed only {back:.2f} back into/through c1 body, need {MIN_CLOSE_BEYOND}"
-    return True, f"MATCH move {move:.2f} gap {gap:.2f} back {back:.2f}"
+        return False, f"c2 closed only {back:.2f} below c1, need {MIN_CLOSE_BEYOND}"
+    return True, f"MATCH run-up {move:.2f} gap {gap:.2f} back {back:.2f}"
 
 
-def one_side(sell_ok, buy_ok):
-    """Returns 'sell', 'buy' or None (nothing, or both matched which we skip)."""
-    if sell_ok and buy_ok:
-        return None
-    return "sell" if sell_ok else ("buy" if buy_ok else None)
+def step_ok(candles):
+    """Step rule: among the 5 candles before candle 1 there are two NEIGHBOURING bullish
+    candles where the second closes higher than the first."""
+    c1 = len(candles) - 2
+    pre = candles[c1 - TOP_LOOKBACK:c1]
+    for a, b in zip(pre, pre[1:]):
+        if a[4] > a[1] and b[4] > b[1] and b[4] > a[4]:
+            return True
+    return False
 
 
-def open_paper_trade(variant, tf, direction, entry, spread, c2_ts):
-    if direction == "sell":
-        sl, tp = entry + SL_POINTS, entry - TP_POINTS
-    else:
-        sl, tp = entry - SL_POINTS, entry + TP_POINTS
-    tid = insert_trade(variant, tf, direction, entry, sl, tp, spread, c2_ts)
-    if variant == "AFTER_SL":                           # BASELINE stays silent
-        icon = "🔴" if direction == "sell" else "🟢"
+def reset_pair(candles, tf):
+    """Block reset rule: the last two candles look like a sell pair (candle 1 bullish, candle 2
+    opens at candle 1's close and closes at least MIN_CLOSE_BEYOND below it). Nothing else."""
+    if len(candles) < 2:
+        return False
+    c1, c2 = candles[-2], candles[-1]
+    if c2[0] - c1[0] != tf * 60000:
+        return False
+    return (c1[4] > c1[1] and abs(c1[4] - c2[1]) <= GAP_TOLERANCE
+            and c1[4] - c2[4] >= MIN_CLOSE_BEYOND)
+
+
+# ---------------- STOP-LOSS BLOCK STATE (kept in the database) ----------------
+def blk_get(tf):
+    """(blocked?, straight-candle count, SL time in ms, last counted candle ts)."""
+    return (get_meta(f"sblk_on_{tf}") == "1", int(get_meta(f"sblk_count_{tf}") or 0),
+            int(get_meta(f"sblk_since_{tf}") or 0), int(get_meta(f"sblk_last_{tf}") or 0))
+
+
+def blk_set(tf, on, count, since, last):
+    set_meta(f"sblk_on_{tf}", "1" if on else "0")
+    set_meta(f"sblk_count_{tf}", str(count))
+    set_meta(f"sblk_since_{tf}", str(since))
+    set_meta(f"sblk_last_{tf}", str(last))
+
+
+# ---------------- SCAN ----------------
+def open_paper_trade(variant, tf, entry, spread, c2_ts):
+    sl, tp = entry + SL_POINTS, entry - TP_POINTS
+    tid = insert_trade(variant, tf, entry, sl, tp, spread, c2_ts)
+    if variant == "MAIN":                               # BASELINE stays silent
         send_telegram(
-            f"{icon} *{direction.upper()} | GOLD {tf}M*\n"
-            f"Entry: `{entry:.2f}`\n"
-            f"SL: `{sl:.2f}`\n"
-            f"TP: `{tp:.2f}`\n"
-            f"Spread: `{spread:.2f}`\n"
-            f"Signal time: {hm(c2_ts)} UTC")
+            f"🔴 *GOLD {tf}M SELL* (#{tid}) PAPER\n"
+            f"Entry: `{entry:.2f}`\nSL: `{sl:.2f}`\nTP: `{tp:.2f}`\nSpread: `{spread:.2f}`")
     return tid
 
 
@@ -373,69 +334,64 @@ def scan(tf, boundary_ms):
     """Candle 2 has just closed. True = finished. False = retry (data/quote problem)."""
     tf_ms = tf * 60000
     last_closed = boundary_ms - tf_ms                   # open time of candle 2
-    base_free = not open_trades(tf, "BASELINE")
-    asl_free = not open_trades(tf, "AFTER_SL")
-    bkey, akey = f"B-{tf}M-{last_closed}", f"A-{tf}M-{last_closed}"
-    base_todo = base_free and not signaled(bkey)
-    asl_todo = asl_free and not signaled(akey)
-    locks = {d: lock_get(tf, d) for d in ("sell", "buy")}
-    need_count = any(l[0] and l[3] != last_closed for l in locks.values())
-    if not (base_todo or asl_todo or need_count):
+    bkey, mkey, skey = f"B-{tf}M-{last_closed}", f"M-{tf}M-{last_closed}", f"S-{tf}M-{last_closed}"
+    base_todo = not open_trades(tf, "BASELINE") and not signaled(bkey)
+    main_todo = not open_trades(tf, "MAIN") and not signaled(mkey)
+    blocked, count, since, last = blk_get(tf)
+    need_count = blocked and last != last_closed
+    if not (base_todo or main_todo or need_count):
         return True
 
     try:
-        now_ms = int(time.time() * 1000)
-        sell_c = get_candles("sell", tf, now_ms)
-        buy_c = get_candles("buy", tf, now_ms)
+        candles = get_candles(tf, int(time.time() * 1000))
     except Exception as e:
         log_once(f"fetch-{tf}", f"{tf}M candle fetch failed: {type(e).__name__}: {str(e)[:150]}")
         return False
-    if not sell_c or not buy_c or sell_c[-1][0] != last_closed or buy_c[-1][0] != last_closed:
+    if not candles or candles[-1][0] != last_closed:
         log_once(f"late-{tf}", f"{tf}M latest candle {last_closed} not available yet, retrying")
         return False
 
-    s_ok, s_why = evaluate("sell", sell_c, tf)
-    b_ok, b_why = evaluate("buy", buy_c, tf)
-    log(f"{tf}M [{hm(last_closed)}] sell: {s_why} | buy: {b_why}")
-    side = one_side(s_ok, b_ok)
+    ok, why = evaluate_sell(candles, tf)
+    log(f"{tf}M [{hm(last_closed)}] sell: {why}")
 
-    # ---- update the straight-candle count of each locked direction ----
-    for d in ("sell", "buy"):
-        on, count, since, last = locks[d]
-        if not on or last == last_closed or last_closed < since:
-            continue                                    # not locked, already counted, or candle began before the SL
-        series = sell_c if d == "sell" else buy_c
-        candle = series[-1]
+    # ---- update the straight-candle count after a stop-loss ----
+    if need_count and last_closed + tf_ms > since:
+        candle = candles[-1]
         if last and last_closed - last > tf_ms:
             count = 0                                   # a candle was missed, not "straight"
-        if restart_ok(d, series, tf):
-            count = 0                                   # restart rule wins over a straight candle
-            why = "restart rule passed, count back to 0"
-        elif moving(d, candle):
+        if reset_pair(candles, tf):
+            count = 0                                   # a sell-like pair restarts the count
+        elif candle[4] < candle[1]:                     # a falling candle
             count += 1
-            why = "straight candle"
         else:
             count = 0
-            why = "not straight, count back to 0"
         if count >= STRAIGHT_CANDLES:
-            log(f"{tf}M {d.upper()} unlocked after {STRAIGHT_CANDLES} straight candles")
-            lock_set(tf, d, False, 0, 0, 0)
-            locks[d] = (False, 0, 0, 0)
+            log(f"{tf}M sell block lifted after {STRAIGHT_CANDLES} straight falling candles")
+            blk_set(tf, False, 0, 0, 0)
+            blocked = False
         else:
-            lock_set(tf, d, True, count, since, last_closed)
-            locks[d] = (True, count, since, last_closed)
-            log(f"{tf}M {d.upper()} lock {count}/{STRAIGHT_CANDLES} ({why})")
+            blk_set(tf, True, count, since, last_closed)
+            log(f"{tf}M sell block: {count}/{STRAIGHT_CANDLES} straight falling candles")
+
+    if not ok:
+        return True
 
     # ---- decide what each stream does ----
     plan = []
-    if base_todo and side:
-        plan.append(("BASELINE", side, bkey))
-    if asl_todo and side:
-        if locks[side][0]:
-            log(f"{tf}M {side.upper()} signal skipped: locked ({locks[side][1]}/{STRAIGHT_CANDLES})")
-            log_signal(akey)
+    if base_todo:
+        plan.append(("BASELINE", bkey))
+    if main_todo:
+        if blocked:
+            reason = "block"
+        elif not step_ok(candles):
+            reason = "step"
         else:
-            plan.append(("AFTER_SL", side, akey))
+            reason = None
+            plan.append(("MAIN", mkey))
+        if reason and not signaled(skey):               # count each skipped signal once
+            log_signal(skey)
+            bump(f"skip_{reason}_{tf}")
+            log(f"{tf}M MAIN signal skipped by the {reason} rule")
     if not plan:
         return True
 
@@ -445,15 +401,13 @@ def scan(tf, boundary_ms):
         log(f"{tf}M signal matched but quote fetch failed: {e}")
         return False
     spread = ask - bid
-    for variant, direction, key in plan:
+    for variant, key in plan:
         log_signal(key)
         if spread > MAX_SPREAD:
-            log(f"{tf}M {variant} {direction} skipped: spread {spread:.2f} > {MAX_SPREAD}")
+            log(f"{tf}M {variant} skipped: spread {spread:.2f} > {MAX_SPREAD}")
             continue
-        entry = bid if direction == "sell" else ask     # sell fills at bid, buy at ask
-        open_paper_trade(variant, tf, direction, entry, spread, last_closed)
-        log(f"{tf}M [{hm(last_closed)}] {variant} {direction.upper()} @ {entry:.2f} "
-            f"(spread {spread:.2f})")
+        open_paper_trade(variant, tf, bid, spread, last_closed)     # a sell fills at the bid
+        log(f"{tf}M [{hm(last_closed)}] {variant} SELL @ {bid:.2f} (spread {spread:.2f})")
     return True
 
 
@@ -469,33 +423,25 @@ def monitor():
         return
 
     for t in trades:
-        if t["side"] == "sell":                         # a sell closes at the ask
-            px, hit_sl, hit_tp = ask, ask >= t["sl"], ask <= t["tp"]
-            pnl = t["entry"] - px
-        else:                                           # a buy closes at the bid
-            px, hit_sl, hit_tp = bid, bid <= t["sl"], bid >= t["tp"]
-            pnl = px - t["entry"]
+        px = ask                                        # a sell closes at the ask
+        hit_sl, hit_tp = px >= t["sl"], px <= t["tp"]
         if not (hit_sl or hit_tp):
             continue
+        pnl = t["entry"] - px
         outcome = "SL" if hit_sl else "TP"
         close_trade(t["id"], outcome, px, pnl)          # recorded at the price the check saw
-        log(f"trade #{t['id']} {t['tf']}M {t['variant']} {t['side']} {outcome} "
-            f"entry {t['entry']:.2f} exit {px:.2f} pnl {pnl:+.2f}")
-        if t["variant"] != "AFTER_SL":                  # BASELINE stays silent
-            continue
+        log(f"trade #{t['id']} {t['tf']}M {t['variant']} {outcome} entry {t['entry']:.2f} "
+            f"exit {px:.2f} pnl {pnl:+.2f}")
+        if t["variant"] != "MAIN":
+            continue                                    # BASELINE stays silent
         extra = ""
-        if outcome == "SL":                             # a stop-loss locks that direction on that timeframe
-            lock_set(t["tf"], t["side"], True, 0, int(time.time() * 1000), 0)
-            word = "falling" if t["side"] == "sell" else "rising"
-            extra = f"\n🔒 {t['side'].upper()} locked until {STRAIGHT_CANDLES} straight {word} candles"
+        if outcome == "SL":                             # a stop-loss starts the block
+            blk_set(t["tf"], True, 0, int(time.time() * 1000), 0)
+            extra = f"\nSells paused until {STRAIGHT_CANDLES} falling candles"
         icon = "✅" if outcome == "TP" else "❌"
-        word = "TP hit" if outcome == "TP" else "SL hit"
         send_telegram(
-            f"{icon} *{t['side'].upper()} | GOLD {t['tf']}M closed: {word}*\n"
-            f"Entry: `{t['entry']:.2f}`\n"
-            f"Exit: `{px:.2f}`\n"
-            f"Result: `{pnl:+.2f}` points\n"
-            f"Signal time: {hm(t['c2_ts'])} UTC{extra}")
+            f"{icon} *GOLD {t['tf']}M SELL #{t['id']} closed: {outcome}*\n"
+            f"Entry `{t['entry']:.2f}` -> exit `{px:.2f}`\nResult: `{pnl:+.2f}` points{extra}")
 
 
 # ---------------- SUMMARY ----------------
@@ -507,7 +453,7 @@ def summary():
         return
     if (now - datetime.fromisoformat(last)).total_seconds() < SUMMARY_INTERVAL_SECONDS:
         return
-    rows = db("""SELECT variant, tf, side, outcome, pnl FROM trades
+    rows = db("""SELECT variant, tf, outcome, pnl FROM trades
                  WHERE status='closed' AND closed_at>=?""", (last,), fetch=True)
 
     def line(label, sub):
@@ -515,17 +461,15 @@ def summary():
         net = sum(r["pnl"] or 0 for r in sub)
         return f"{label}: {len(sub)} closed | TP {tp} | SL {len(sub) - tp} | Net `{net:+.2f}`"
 
-    parts = ["📊 *Daily Summary (PAPER)*"]
+    parts = ["📊 *Daily Summary (PAPER, sell only)*"]
     for tf in TIMEFRAMES:
         base = [r for r in rows if r["tf"] == tf and r["variant"] == "BASELINE"]
-        asl = [r for r in rows if r["tf"] == tf and r["variant"] == "AFTER_SL"]
-        parts += ["", f"*{tf}M*",
-                  line("With locks", asl),
-                  line("   sells", [r for r in asl if r["side"] == "sell"]),
-                  line("   buys", [r for r in asl if r["side"] == "buy"]),
-                  line("No locks (baseline)", base),
-                  line("   sells", [r for r in base if r["side"] == "sell"]),
-                  line("   buys", [r for r in base if r["side"] == "buy"])]
+        main = [r for r in rows if r["tf"] == tf and r["variant"] == "MAIN"]
+        parts += ["", f"*{tf}M*", line("Baseline (old rules)", base), line("New rules", main),
+                  f"Skipped by block: {get_meta(f'skip_block_{tf}') or 0} | "
+                  f"Skipped by step rule: {get_meta(f'skip_step_{tf}') or 0}"]
+        set_meta(f"skip_block_{tf}", "0")
+        set_meta(f"skip_step_{tf}", "0")
     send_telegram("\n".join(parts))
     set_meta("last_summary_sent", now.isoformat())
 
@@ -534,12 +478,12 @@ def summary():
 def pick_source():
     try:
         bid, ask = fetch_quote()
-        c = get_candles("sell", 3, int(time.time() * 1000))
+        c = get_candles(5, int(time.time() * 1000))
         if not c:
             log("[SOURCE] no candles could be built")
             return False
         log(f"[SOURCE] {SYMBOL}: bid {bid:.2f} ask {ask:.2f} spread {ask - bid:.2f}; "
-            f"latest closed 3M candle {hm(c[-1][0])} UTC close {c[-1][4]:.2f}")
+            f"latest closed 5M candle {hm(c[-1][0])} UTC close {c[-1][4]:.2f}")
         return True
     except Exception as e:
         log(f"[SOURCE] failed: {type(e).__name__}: {str(e)[:200]}")
@@ -554,7 +498,7 @@ def main():
     API_SECRET = os.environ["BITGET_API_SECRET"]
     API_PASS = os.environ["BITGET_API_PASSPHRASE"]
     SYMBOL = os.environ.get("CFD_SYMBOL", "XAUUSD")
-    DB_PATH = os.environ.get("DB_PATH", "gold_3m5m.db")
+    DB_PATH = os.environ.get("DB_PATH", "gold_5m10m.db")
     mode = os.environ.get("MODE", "PAPER").upper()
     if mode != "PAPER":
         log(f"MODE={mode} is not supported yet. Only PAPER is available. Exiting.")
@@ -565,11 +509,10 @@ def main():
         log("No data reachable, retrying in 60s")
         time.sleep(60)
 
-    send_telegram(f"✅ *Gold 3M + 5M bot started* [PAPER]\n"
-                  f"Symbol: {SYMBOL}\n"
-                  f"SL {SL_POINTS:.0f} / TP {TP_POINTS:.0f}\n"
-                  f"Lock: {STRAIGHT_CANDLES} straight candles after a stop-loss")
-    log("3M + 5M bot running in PAPER mode")
+    send_telegram(f"✅ Gold 5M + 10M bot started (sell only) PAPER\nSymbol: {SYMBOL}\n"
+                  f"5M run-up >= {SETTINGS[5]['min_move']:.0f} | 10M run-up >= {SETTINGS[10]['min_move']:.0f} "
+                  f"| SL {SL_POINTS:.0f} / TP {TP_POINTS:.0f}")
+    log("5M + 10M sell-only bot running in PAPER mode")
 
     last_scan = {tf: None for tf in TIMEFRAMES}
     last_summary = 0
